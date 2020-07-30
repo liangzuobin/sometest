@@ -27,6 +27,7 @@ func init() {
 	cli = pb.NewStorageClient(cc)
 }
 
+// test it with `$ ./go-wrk -c=100 -t=5 -k=true -n=1000 http://127.0.0.1:8090/get`
 func main() {
 
 	// go loopPut()
