@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,25 +19,39 @@ import (
 
 var cli pb.StorageClient
 
-func init() {
-	cc, err := grpc.Dial("127.0.0.1:9080", grpc.WithInsecure())
+// test it with `$ ./go-wrk -c=100 -t=5 -k=true -n=1000 http://127.0.0.1:8090/get`
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cc, err := grpc.DialContext(ctx, "10.13.254.37:9080", grpc.WithInsecure())
 	if err != nil {
+		cancel()
 		log.Fatal(err)
 	}
 
 	cli = pb.NewStorageClient(cc)
-}
 
-// test it with `$ ./go-wrk -c=100 -t=5 -k=true -n=1000 http://127.0.0.1:8090/get`
-func main() {
-
-	// go loopPut()
+	var once sync.Once
 
 	go func() {
+		cc, err := grpc.DialContext(ctx, "10.13.254.37:9080", grpc.WithInsecure())
+		if err != nil {
+			cancel()
+			log.Fatal(err)
+		}
+
+		otherCli := pb.NewStorageClient(cc)
+
 		http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
-			resp, err := cli.Get(r.Context(), &pb.JustKey{Key: "foo"})
+			once.Do(func() {
+				go loopPut(ctx) // 启用干扰用的 stream
+			})
+
+			// resp, err := cli.Get(r.Context(), &pb.JustKey{Key: "foo"})
+			resp, err := otherCli.Get(r.Context(), &pb.JustKey{Key: "foo"})
 			if err != nil {
-				log.Println(err)
+				log.Printf("/get failed: %v", err)
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -50,23 +65,52 @@ func main() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
-	time.Sleep(time.Second)
+	cancel()
+	time.Sleep(3 * time.Second)
 }
 
-func loopPut() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func loopPut(ctx context.Context) {
+	n := 300
 
-	ch := make(chan struct{}, 1000)
+	errors := make(chan error, n)
+
+	go func() {
+		m := make(map[string]int, 32)
+
+		defer func() {
+			log.Printf("errors count %v", len(m))
+
+			for k, v := range m {
+				log.Printf("err: %v \ncount %v", k, v)
+			}
+		}()
+
+		for err := range errors {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				m[err.Error()]++
+			}
+		}
+	}()
+
+	ratio := make(chan struct{}, n)
 
 	for {
-		ch <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		ratio <- struct{}{}
 
 		go func() {
-			defer func() { <-ch }()
+			defer func() { <-ratio }()
 
 			if err := putFile(ctx); err != nil {
-				log.Println(err)
+				errors <- err
 			}
 		}()
 	}
@@ -79,11 +123,6 @@ func putFile(ctx context.Context) error {
 	}
 
 	p := filepath.Join(wd, "main.go")
-
-	f, err := os.Open(p)
-	if err != nil {
-		return err
-	}
 
 	str, err := cli.Put(ctx)
 	if err != nil {
@@ -99,6 +138,12 @@ func putFile(ctx context.Context) error {
 	send := func(n int) error {
 		return str.Send(&pb.StreamReq{Value: buf[:n]})
 	}
+
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
 	for {
 		switch n, err := f.Read(buf); err {
