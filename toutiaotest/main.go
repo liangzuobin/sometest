@@ -86,7 +86,3 @@ func subsets(nums []int) [][]int {
 	}
 	return res
 }
-
-func reverse(x int) int {
-	b := []byte(x)
-}

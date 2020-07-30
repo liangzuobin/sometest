@@ -1,0 +1,21 @@
+syntax = "proto3";
+package demo;
+
+message JustKey {
+	string key = 1;
+}
+
+message JustBytes {
+	bytes bytes = 1;
+}
+
+message StreamReq {
+	string key = 1;
+	bytes value = 2;
+}
+
+service Storage {
+	rpc Get(JustKey) returns (JustBytes);
+	rpc Put(stream StreamReq) returns (JustBytes);
+	rpc Put2(stream StreamReq) returns (JustBytes);
+}
