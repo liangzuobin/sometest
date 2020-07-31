@@ -2,13 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -17,39 +16,85 @@ import (
 	"google.golang.org/grpc"
 )
 
-var cli pb.StorageClient
+type clientFunc func(ctx context.Context, unary bool) pb.StorageClient
+
+var cli clientFunc
+
+func mustNewClient(ctx context.Context) pb.StorageClient {
+	cc, err := grpc.DialContext(ctx, "10.13.254.37:9080", grpc.WithInsecure())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return pb.NewStorageClient(cc)
+}
+
+func singleClient(ctx context.Context) clientFunc {
+	cli := mustNewClient(ctx)
+
+	return func(context.Context, bool) pb.StorageClient {
+		return cli
+	}
+}
+
+func separateClient(ctx context.Context) clientFunc {
+	unr, str := mustNewClient(ctx), mustNewClient(ctx)
+
+	return func(ctx context.Context, unary bool) pb.StorageClient {
+		if unary {
+			return unr
+		}
+		return str
+	}
+}
+
+func pooledClient(ctx context.Context) clientFunc {
+	var next int64
+	pool := []pb.StorageClient{mustNewClient(ctx), mustNewClient(ctx)}
+	var mu sync.Mutex
+
+	return func(context.Context, bool) pb.StorageClient {
+
+		// nn := atomic.AddInt64(&next, 1)
+
+		mu.Lock()
+		defer mu.Unlock()
+		next++
+		nn := next
+
+		return pool[nn&1] // FIXME 因为只有两个 client 才这么处理
+	}
+}
 
 // test it with `$ ./go-wrk -c=100 -t=5 -k=true -n=1000 http://127.0.0.1:8090/get`
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cc, err := grpc.DialContext(ctx, "10.13.254.37:9080", grpc.WithInsecure())
-	if err != nil {
-		cancel()
-		log.Fatal(err)
-	}
+	// 每次调用 client 返回相同的连接
+	// cli = singleClient(ctx)
 
-	cli = pb.NewStorageClient(cc)
+	// 所有 unary 请求共享一个 client；stream 请求共用一个 client
+	cli = separateClient(ctx)
+
+	// 每次请求，创建新的链接 // 有 bug 创建完了没有关闭掉
+	// cli = func(ctx context.Context, _ bool) pb.StorageClient {
+	// 	return mustNewClient(ctx)
+	// }
+
+	// 从一个只有两个链接的链接池里拿
+	// cli = pooledClient(ctx)
 
 	var once sync.Once
 
 	go func() {
-		cc, err := grpc.DialContext(ctx, "10.13.254.37:9080", grpc.WithInsecure())
-		if err != nil {
-			cancel()
-			log.Fatal(err)
-		}
-
-		otherCli := pb.NewStorageClient(cc)
 
 		http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
 			once.Do(func() {
-				go loopPut(ctx) // 启用干扰用的 stream
+				go loopPut(ctx, 200) // 启用干扰用的 stream
 			})
 
-			// resp, err := cli.Get(r.Context(), &pb.JustKey{Key: "foo"})
-			resp, err := otherCli.Get(r.Context(), &pb.JustKey{Key: "foo"})
+			resp, err := cli(ctx, true).Get(r.Context(), &pb.JustKey{Key: "foo"})
 			if err != nil {
 				log.Printf("/get failed: %v", err)
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -66,12 +111,10 @@ func main() {
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
 	cancel()
-	time.Sleep(3 * time.Second)
+	time.Sleep(time.Second)
 }
 
-func loopPut(ctx context.Context) {
-	n := 300
-
+func loopPut(ctx context.Context, n int) {
 	errors := make(chan error, n)
 
 	go func() {
@@ -95,76 +138,53 @@ func loopPut(ctx context.Context) {
 		}
 	}()
 
-	ratio := make(chan struct{}, n)
+	ch := make(chan struct{}, n)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
+		case ch <- struct{}{}:
 		}
 
-		ratio <- struct{}{}
-
 		go func() {
-			defer func() { <-ratio }()
+			defer func() { <-ch }()
 
-			if err := putFile(ctx); err != nil {
+			if err := put(ctx); err != nil {
 				errors <- err
 			}
 		}()
 	}
 }
 
-func putFile(ctx context.Context) error {
-	wd, err := os.Getwd()
+func put(ctx context.Context) error {
+	str, err := cli(ctx, false).Put(ctx)
 	if err != nil {
 		return err
 	}
 
-	p := filepath.Join(wd, "main.go")
-
-	str, err := cli.Put(ctx)
-	if err != nil {
+	if err := str.Send(&pb.StreamReq{Key: "hello"}); err != nil {
 		return err
 	}
 
-	if err := str.Send(&pb.StreamReq{Key: p}); err != nil {
-		return err
-	}
+	// 每次 32k 数据，发 10 次
+	p := make([]byte, 32*1024)
 
-	buf := make([]byte, 1024)
+	for i := 0; i < 10; i++ {
+		n, err := rand.Reader.Read(p)
+		if err != nil {
+			_ = str.CloseSend()
+			return err
+		}
 
-	send := func(n int) error {
-		return str.Send(&pb.StreamReq{Value: buf[:n]})
-	}
-
-	f, err := os.Open(p)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	for {
-		switch n, err := f.Read(buf); err {
-		case nil:
-			if err := send(n); err != nil {
-				return err
-			}
-		case io.EOF:
-			if n > 0 {
-				if err := send(n); err != nil {
-					return err
-				}
-			}
-
-			if _, err := str.CloseAndRecv(); err != nil {
-				return err
-			}
-
-			return nil
-		default:
+		if err := str.Send(&pb.StreamReq{Value: p[:n]}); err != nil {
 			return err
 		}
 	}
+
+	if _, err := str.CloseAndRecv(); err != nil {
+		return err
+	}
+
+	return nil
 }
