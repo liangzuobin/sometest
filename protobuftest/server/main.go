@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -26,7 +28,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	svr := grpc.NewServer(grpc.MaxConcurrentStreams(10))
+	// svr := grpc.NewServer(grpc.MaxConcurrentStreams(10))
+	svr := grpc.NewServer()
 	pb.RegisterStorageServer(svr, &server{})
 
 	go func() {
@@ -98,11 +101,11 @@ func (s *server) Put(stream pb.Storage_PutServer) error {
 
 	md, err := stream.Recv()
 	if err != nil {
-		log.Printf("recv md got: %v", err)
+		log.Printf("recv md got: %v, %v", md, err)
 		return err
 	}
 
-	log.Printf("receive: %v", md.Key)
+	// log.Printf("receive: %v", md.Key)
 
 	// 这里返回 error 不会导致客户端 EOF
 	// if i, err := strconv.Atoi(md.Key); err == nil && i%10 == 0 {
@@ -115,22 +118,26 @@ func (s *server) Put(stream pb.Storage_PutServer) error {
 		stream: stream,
 	}
 
-	req, err := http.NewRequest("PUT", "http://127.0.0.1:8080/put", rd)
-	if err != nil {
-		log.Printf("new req got: %v", err)
+	if _, err := io.Copy(ioutil.Discard, rd); err != nil {
 		return err
 	}
 
-	resp, err := client.Do(req.WithContext(ctx))
-	if err != nil {
-		log.Printf("put got: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
+	// req, err := http.NewRequest("PUT", "http://127.0.0.1:8080/put", rd)
+	// if err != nil {
+	// 	log.Printf("new req got: %v", err)
+	// 	return err
+	// }
 
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("not ok: %v", resp.Status)
-	}
+	// resp, err := client.Do(req.WithContext(ctx))
+	// if err != nil {
+	// 	log.Printf("put got: %v", err)
+	// 	return err
+	// }
+	// defer resp.Body.Close()
+
+	// if resp.StatusCode != 200 {
+	// 	return fmt.Errorf("not ok: %v", resp.Status)
+	// }
 
 	return stream.SendAndClose(&pb.JustBytes{}) // 这样 client 在执行 CloseAndRecv() 的时候，就不会报 io.EOF 了
 }
